@@ -14,6 +14,7 @@ import { createScrimArbitrationTicket } from '../lib/arbitration.js';
 import { computeTeamSRTrimmed, isMatchupBalanced, validateRosterBalance } from '../lib/lol.js';
 import { CHECK_IN_EMOJI, CHECK_IN_REQUIRED } from '../lib/scrim-checkin.js';
 import { cancelScrimReminders, registerScrimReminders } from '../lib/scrim-scheduler.js';
+import { applyReliabilityChange, formatCooldown, isTeamOnCooldown } from '../lib/reliability.js';
 import {
   memberStore,
   scrimStore,
@@ -180,6 +181,13 @@ const scrimHandlers: HandlerMap = {
     if (scheduledAt.getTime() <= Date.now()) return reply(interaction, '⚠️ La date doit être dans le futur pour publier un scrim.');
     const hostTeam = await ensureCaptainTeam(interaction.user.id);
     if (!hostTeam) return reply(interaction, '⚠️ Aucune équipe dont tu es capitaine trouvée.');
+    if (isTeamOnCooldown(hostTeam)) {
+      const until = formatCooldown(hostTeam) ?? hostTeam.scrimCooldownUntil ?? 'expiration inconnue';
+      return reply(
+        interaction,
+        `⚠️ ${hostTeam.name} est en cooldown scrim jusqu’au ${until}. Patiente avant de publier un nouveau scrim.`,
+      );
+    }
     const members = await memberStore.read();
     const hostRoster = await ensureRosterReady(interaction, hostTeam, members, 'publier');
     if (!hostRoster) return;
@@ -204,6 +212,13 @@ const scrimHandlers: HandlerMap = {
     const guestTeam = await ensureCaptainTeam(interaction.user.id);
     if (!guestTeam) return reply(interaction, '⚠️ Aucune équipe dont tu es capitaine trouvée pour accepter.');
     if (guestTeam.id === scrim.hostTeamId) return reply(interaction, '⚠️ Ton équipe est déjà hôte de ce scrim.');
+    if (isTeamOnCooldown(guestTeam)) {
+      const until = formatCooldown(guestTeam) ?? guestTeam.scrimCooldownUntil ?? 'expiration inconnue';
+      return reply(
+        interaction,
+        `⚠️ ${guestTeam.name} est en cooldown scrim jusqu’au ${until}. Impossible d’accepter pour le moment.`,
+      );
+    }
     const [teams, members] = await Promise.all([teamStore.read(), memberStore.read()]);
     const hostTeam = teams.find((team) => team.id === scrim.hostTeamId);
     if (!hostTeam) return reply(interaction, '❌ Équipe hôte introuvable.');
@@ -487,15 +502,9 @@ const scrimHandlers: HandlerMap = {
           : record,
       ),
     );
-    if (penaltyApplies) {
-      await teamStore.update((teams) =>
-        teams.map((team) =>
-          team.id === cancellingTeam.id
-            ? { ...team, reliability: Math.max(0, team.reliability - 10), updatedAt: timestamp }
-            : team,
-        ),
-      );
-    }
+    const reliabilityPenalty = penaltyApplies
+      ? await applyReliabilityChange({ teamId: cancellingTeam.id, delta: -10, timestamp })
+      : undefined;
     cancelScrimReminders(scrim.id);
 
     if (scrim.threadId) {
@@ -503,7 +512,9 @@ const scrimHandlers: HandlerMap = {
       if (channel && 'isThread' in channel && channel.isThread()) {
         const target = channel as AnyThreadChannel;
         const penaltyNote = penaltyApplies
-          ? 'Pénalité : -10 fiabilité (annulation < 60 min).'
+          ? `Pénalité : -10 fiabilité${
+              reliabilityPenalty ? ` (${reliabilityPenalty.previous} → ${reliabilityPenalty.next})` : ''
+            } (annulation < 60 min).`
           : 'Aucune pénalité appliquée (annulation anticipée).';
         await target
           .send(
@@ -516,7 +527,11 @@ const scrimHandlers: HandlerMap = {
     await reply(
       interaction,
       `✅ Scrim ${scrim.id} annulé. ${
-        penaltyApplies ? 'Une pénalité de fiabilité a été appliquée.' : 'Aucune pénalité appliquée.'
+        penaltyApplies
+          ? `Fiabilité ${
+              reliabilityPenalty ? `${reliabilityPenalty.previous} → ${reliabilityPenalty.next}` : 'ajustée'
+            } (annulation tardive).`
+          : 'Aucune pénalité appliquée.'
       }`,
     );
   },

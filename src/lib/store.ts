@@ -62,6 +62,7 @@ export type Team = Timestamped & {
   captainId?: string;
   members: TeamRosterSlot[];
   reliability: number;
+  scrimCooldownUntil?: string;
 };
 export type ScrimRoster = { teamId: string; playerIds: string[]; coachIds: string[]; declaredSr: number };
 export type ScrimCheckIn = { teamId: string; userIds: string[]; completedAt?: string };

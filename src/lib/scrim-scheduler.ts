@@ -1,5 +1,6 @@
 import type { Client, TextBasedChannel } from 'discord.js';
 
+import { applyReliabilityChange } from './reliability.js';
 import { scrimStore, teamStore, type Scrim, type ScrimStatus } from './store.js';
 
 const ACTIVE_STATUSES = new Set<ScrimStatus>(['CONFIRMED', 'PRACTICE']);
@@ -48,7 +49,10 @@ const applyNoShow = async (scrim: Scrim) => {
     });
   if (missing.length === 0) return;
 
-  const timestamp = new Date().toISOString();
+  const now = new Date();
+  const timestamp = now.toISOString();
+  const cooldownHours = scrim.queueLevel === 'Open' ? 24 : 48;
+  const cooldownUntil = new Date(now.getTime() + cooldownHours * 3_600_000).toISOString();
   await scrimStore.update((collection) =>
     collection.map((record) =>
       record.id === scrim.id
@@ -59,10 +63,26 @@ const applyNoShow = async (scrim: Scrim) => {
   clearTimers(scrim.id);
 
   const teams = await teamStore.read();
-  const names = missing
-    .map((teamId) => teams.find((team) => team.id === teamId)?.name ?? `Équipe ${teamId}`)
-    .join(', ');
-  await post(scrim.threadId, `⏱️ No-show constaté après 10 minutes. Équipe(s) concernée(s) : ${names}. Contactez l’arbitrage si besoin.`);
+  const penalties = await Promise.all(
+    missing.map((teamId) =>
+      applyReliabilityChange({ teamId, delta: -15, cooldownUntil, timestamp }).catch(() => undefined),
+    ),
+  );
+  const untilSeconds = Math.floor(new Date(cooldownUntil).getTime() / 1000);
+  const summary = missing
+    .map((teamId, index) => {
+      const label = teams.find((team) => team.id === teamId)?.name ?? `Équipe ${teamId}`;
+      const penalty = penalties[index];
+      const reliabilityLine = penalty
+        ? `fiabilité ${penalty.previous} → ${penalty.next}`
+        : 'fiabilité -15 (erreur mise à jour)';
+      return `• ${label} : ${reliabilityLine} • cooldown jusqu’au <t:${untilSeconds}:F>.`;
+    })
+    .join('\n');
+  await post(
+    scrim.threadId,
+    `⏱️ No-show constaté après 10 minutes.\n${summary}\nContactez l’arbitrage pour toute contestation.`,
+  );
 };
 const scheduleScrim = async (scrim: Scrim) => {
   if (!scrim.threadId) return;

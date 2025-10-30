@@ -25,6 +25,7 @@ import {
   type ScrimReport,
   type Team,
 } from './store.js';
+import { applyReliabilityChange } from './reliability.js';
 
 interface CreateScrimTicketOptions {
   client: Client;
@@ -55,6 +56,7 @@ const buildButtonRow = (ticketId: string, disabled = false) =>
     new ButtonBuilder().setCustomId(`scrim-arb:${ticketId}:refuse`).setLabel('Refuser').setStyle(ButtonStyle.Danger).setDisabled(disabled),
     new ButtonBuilder().setCustomId(`scrim-arb:${ticketId}:needs_info`).setLabel('Demander compléments').setStyle(ButtonStyle.Secondary).setDisabled(disabled),
     new ButtonBuilder().setCustomId(`scrim-arb:${ticketId}:dispute`).setLabel('Ouvrir litige').setStyle(ButtonStyle.Primary).setDisabled(disabled),
+    new ButtonBuilder().setCustomId(`scrim-arb:${ticketId}:disqualify`).setLabel('Disqualifier').setStyle(ButtonStyle.Danger).setDisabled(disabled),
   );
 
 export async function createScrimArbitrationTicket(options: CreateScrimTicketOptions): Promise<ArbitrationTicket> {
@@ -168,16 +170,17 @@ export async function createLadderArbitrationTicket(options: CreateLadderTicketO
   return ticket;
 }
 
-type ButtonAction = 'validate' | 'refuse' | 'needs_info' | 'dispute';
+type ButtonAction = 'validate' | 'refuse' | 'needs_info' | 'dispute' | 'disqualify';
 type ModalAction = Exclude<ButtonAction, 'validate'>;
 
-const BUTTON_REGEX = /^scrim-arb:([^:]+):(validate|refuse|needs_info|dispute)$/;
+const BUTTON_REGEX = /^scrim-arb:([^:]+):(validate|refuse|needs_info|dispute|disqualify)$/;
 const FINAL_STATES = new Set<ArbitrationTicket['state']>(['VALIDATED', 'REFUSED', 'DISPUTE', 'DISQUALIFIED']);
 const STATE_STYLES: Record<string, { color: number; description: string }> = {
   VALIDATED: { color: 0x16a34a, description: '✅ Résultat validé.' },
   REFUSED: { color: 0xef4444, description: '❌ Rapport refusé.' },
   NEEDS_INFO: { color: 0x0ea5e9, description: 'ℹ️ Compléments requis.' },
   DISPUTE: { color: 0x8b5cf6, description: '⚖️ Litige ouvert.' },
+  DISQUALIFIED: { color: 0x991b1b, description: '⛔ Match disqualifié pour fraude.' },
 };
 
 const ensureStaff = async (interaction: ButtonInteraction | ModalSubmitInteraction) => {
@@ -284,12 +287,35 @@ export async function handleArbitrationButton(interaction: ButtonInteraction): P
   if (action !== 'validate') {
     const modal = new ModalBuilder()
       .setCustomId(`scrim-arb:${ticketId}:${action}:modal`)
-      .setTitle(action === 'refuse' ? 'Refuser le rapport' : action === 'dispute' ? 'Ouvrir un litige' : 'Demander des compléments')
-      .addComponents(
+      .setTitle(
+        action === 'refuse'
+          ? 'Refuser le rapport'
+          : action === 'dispute'
+            ? 'Ouvrir un litige'
+            : action === 'disqualify'
+              ? 'Disqualifier pour fraude'
+              : 'Demander des compléments',
+      );
+    if (action === 'disqualify') {
+      modal.addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
-          new TextInputBuilder().setCustomId('reason').setLabel('Détails').setStyle(TextInputStyle.Paragraph).setRequired(true),
+          new TextInputBuilder()
+            .setCustomId('team')
+            .setLabel('Équipe à disqualifier (host/guest/ID)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true),
         ),
       );
+    }
+    modal.addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId('reason')
+          .setLabel('Détails')
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true),
+      ),
+    );
     await interaction.showModal(modal);
     return true;
   }
@@ -439,12 +465,65 @@ export async function handleArbitrationModal(interaction: ModalSubmitInteraction
     return true;
   }
 
+  let penalizedTeam: Team | undefined;
+  if (action === 'disqualify') {
+    const rawTeam = interaction.fields.getTextInputValue('team').trim();
+    const sanitize = (value: string) => value.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    const target = sanitize(rawTeam);
+    const hostAliases = new Set([
+      context.type === 'scrim' ? context.host.id.toLowerCase() : context.host.id.toLowerCase(),
+      sanitize(context.type === 'scrim' ? context.host.id : context.host.id),
+      context.host.name.toLowerCase(),
+      sanitize(context.host.name),
+      'host',
+      'hote',
+    ]);
+    const guestAliases = new Set([
+      context.type === 'scrim' ? context.guest.id.toLowerCase() : context.guest.id.toLowerCase(),
+      sanitize(context.type === 'scrim' ? context.guest.id : context.guest.id),
+      context.guest.name.toLowerCase(),
+      sanitize(context.guest.name),
+      'guest',
+      'invite',
+      'invitee',
+    ]);
+    const rawLower = rawTeam.toLowerCase();
+    if (hostAliases.has(rawLower) || hostAliases.has(target)) {
+      penalizedTeam = context.host;
+    } else if (guestAliases.has(rawLower) || guestAliases.has(target)) {
+      penalizedTeam = context.guest;
+    }
+    if (!penalizedTeam) {
+      await interaction.editReply('❌ Merci d’indiquer « host » ou « guest » (ou l’ID de l’équipe) pour la disqualification.');
+      return true;
+    }
+  }
+
   const timestamp = new Date().toISOString();
-  const nextState = action === 'needs_info' ? 'NEEDS_INFO' : action === 'refuse' ? 'REFUSED' : 'DISPUTE';
-  const keepResult = action !== 'refuse';
+  let penalty: Awaited<ReturnType<typeof applyReliabilityChange>> | undefined;
+  if (action === 'disqualify' && penalizedTeam) {
+    penalty = await applyReliabilityChange({ teamId: penalizedTeam.id, delta: -25, timestamp }).catch(() => undefined);
+  }
+
+  const nextState =
+    action === 'needs_info'
+      ? 'NEEDS_INFO'
+      : action === 'refuse'
+        ? 'REFUSED'
+        : action === 'disqualify'
+          ? 'DISQUALIFIED'
+          : 'DISPUTE';
+  const keepResult = action !== 'refuse' && action !== 'disqualify';
 
   if (context.type === 'scrim') {
-    const scrimStatus = action === 'refuse' ? 'REFUSED' : action === 'dispute' ? 'DISPUTE' : 'AWAITING_ARBITRATION';
+    const scrimStatus =
+      action === 'refuse'
+        ? 'REFUSED'
+        : action === 'dispute'
+          ? 'DISPUTE'
+          : action === 'disqualify'
+            ? 'DISQUALIFIED'
+            : 'AWAITING_ARBITRATION';
 
     await scrimStore.update((items) =>
       items.map((entry) =>
@@ -452,16 +531,23 @@ export async function handleArbitrationModal(interaction: ModalSubmitInteraction
           ? {
               ...entry,
               status: scrimStatus,
-              result: keepResult ? entry.result : undefined,
-              validatedBy: undefined,
-              validatedAt: undefined,
+              result: action === 'disqualify' ? `DQ (${penalizedTeam?.name ?? 'équipe sanctionnée'})` : keepResult ? entry.result : undefined,
+              validatedBy: action === 'disqualify' ? interaction.user.id : undefined,
+              validatedAt: action === 'disqualify' ? timestamp : undefined,
               updatedAt: timestamp,
             }
           : entry,
       ),
     );
   } else {
-    const ladderStatus = action === 'refuse' ? 'REFUSED' : action === 'dispute' ? 'DISPUTE' : 'AWAITING_ARBITRATION';
+    const ladderStatus =
+      action === 'refuse'
+        ? 'REFUSED'
+        : action === 'dispute'
+          ? 'DISPUTE'
+          : action === 'disqualify'
+            ? 'DISQUALIFIED'
+            : 'AWAITING_ARBITRATION';
     await ladderStore.update((collection) =>
       collection.map((ladder) =>
         ladder.id === context.ladder.id
@@ -472,8 +558,14 @@ export async function handleArbitrationModal(interaction: ModalSubmitInteraction
                   ? {
                       ...match,
                       status: ladderStatus,
-                      result: keepResult ? match.result : undefined,
+                      result:
+                        action === 'disqualify'
+                          ? `DQ (${penalizedTeam?.name ?? 'équipe sanctionnée'})`
+                          : keepResult
+                            ? match.result
+                            : undefined,
                       updatedAt: timestamp,
+                      completedAt: action === 'disqualify' ? timestamp : match.completedAt,
                     }
                   : match,
               ),
@@ -486,7 +578,13 @@ export async function handleArbitrationModal(interaction: ModalSubmitInteraction
   await arbitrationStore.update((items) =>
     items.map((entry) =>
       entry.id === context.ticket.id
-        ? { ...entry, state: nextState, refereeId: interaction.user.id, notes: reason, updatedAt: timestamp }
+        ? {
+            ...entry,
+            state: nextState,
+            refereeId: interaction.user.id,
+            notes: action === 'disqualify' && penalizedTeam ? `${penalizedTeam.name} — ${reason}` : reason,
+            updatedAt: timestamp,
+          }
         : entry,
     ),
   );
@@ -494,14 +592,29 @@ export async function handleArbitrationModal(interaction: ModalSubmitInteraction
   const style = STATE_STYLES[nextState] ?? STATE_STYLES.NEEDS_INFO;
   await editCard(interaction.client, context.ticket, style, nextState !== 'NEEDS_INFO', reason);
   const threadLabel =
-    action === 'refuse' ? '❌ Rapport refusé' : action === 'dispute' ? '⚖️ Litige ouvert' : 'ℹ️ Compléments demandés';
+    action === 'refuse'
+      ? '❌ Rapport refusé'
+      : action === 'dispute'
+        ? '⚖️ Litige ouvert'
+        : action === 'disqualify'
+          ? '⛔ Disqualification prononcée'
+          : 'ℹ️ Compléments demandés';
   if (context.type === 'scrim') {
+    const penaltyInfo =
+      action === 'disqualify' && penalizedTeam
+        ? ` Fiabilité ${penalty ? `${penalty.previous} → ${penalty.next}` : 'ajustée'} (fraude).`
+        : '';
     await notifyThread(
       interaction.client,
       context.scrim,
-      `${mentionCaptains(context.host, context.guest)}${threadLabel} : ${reason}`,
+      `${mentionCaptains(context.host, context.guest)}${threadLabel} : ${reason}${penaltyInfo}`,
     );
   }
-  await interaction.editReply(style.description);
+  let response = style.description;
+  if (action === 'disqualify' && penalizedTeam) {
+    const reliabilityLine = penalty ? `${penalty.previous} → ${penalty.next}` : 'ajustée';
+    response = `⛔ ${penalizedTeam.name} disqualifiée. Fiabilité ${reliabilityLine}.\n📝 ${reason}`;
+  }
+  await interaction.editReply(response);
   return true;
 }

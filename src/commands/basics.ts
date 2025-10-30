@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { SlashCommandBuilder, SlashCommandSubcommandsOnlyBuilder, type ChatInputCommandInteraction } from 'discord.js';
 
 import { computeTeamSRTrimmed, getSkillRatingForRank } from '../lib/lol.js';
+import { formatCooldown, isTeamOnCooldown } from '../lib/reliability.js';
 import {
   ladderStore,
   memberStore,
@@ -176,6 +177,31 @@ const memberHandlers: HandlerMap = {
     );
     if (!updated) return reply(interaction, '⚠️ Aucun profil LoL trouvé pour ce joueur. Utilise `/member add` avant de lier un Riot ID.');
     await reply(interaction, `✅ Riot ID mis à jour pour ${user.tag} : ${riotId}.`);
+  },
+};
+
+const reliabilityHandlers: HandlerMap = {
+  async show(interaction) {
+    const teamId = interaction.options.getString('team', true).trim();
+    const teams = await teamStore.read();
+    const team = teams.find(
+      (entry) => entry.id === teamId || entry.name.toLowerCase() === teamId.toLowerCase(),
+    );
+    if (!team)
+      return reply(
+        interaction,
+        '❌ Équipe introuvable. Utilise l’identifiant exact (via /team create ou /ladder join).',
+      );
+    const cooldownActive = isTeamOnCooldown(team);
+    const cooldownText = team.scrimCooldownUntil
+      ? cooldownActive
+        ? `⏳ Cooldown scrim actif jusqu’au ${formatCooldown(team) ?? team.scrimCooldownUntil}.`
+        : '✅ Aucun cooldown actif (le dernier délai est expiré).'
+      : '✅ Aucun cooldown actif.';
+    await reply(
+      interaction,
+      `📊 Fiabilité ${team.name} : ${Math.round(team.reliability)} / 100.\n${cooldownText}`,
+    );
   },
 };
 
@@ -718,9 +744,25 @@ const ladderCommand = new SlashCommandBuilder()
       .addStringOption((option) => option.setName('ladder_id').setDescription('Identifiant du ladder').setRequired(true)),
   );
 
+const reliabilityCommand = new SlashCommandBuilder()
+  .setName('reliability')
+  .setDescription('Suivi de la fiabilité des équipes LoL')
+  .addSubcommand((sub) =>
+    sub
+      .setName('show')
+      .setDescription('Afficher la fiabilité d’une équipe')
+      .addStringOption((option) =>
+        option
+          .setName('team')
+          .setDescription('Identifiant (ou nom exact) de l’équipe')
+          .setRequired(true),
+      ),
+  );
+
 export const basicCommands: SlashCommand[] = [
   createSlashCommand(orgCommand, orgHandlers, '❌ Sous-commande organisation inconnue.'),
   createSlashCommand(teamCommand, teamHandlers, '❌ Sous-commande équipe inconnue.'),
   createSlashCommand(memberCommand, memberHandlers, '❌ Sous-commande membre inconnue.'),
   createSlashCommand(ladderCommand, ladderHandlers, '❌ Sous-commande ladder inconnue.'),
+  createSlashCommand(reliabilityCommand, reliabilityHandlers, '❌ Sous-commande fiabilité inconnue.'),
 ];
