@@ -11,10 +11,9 @@
 - [x] Étape 6 — Arbitrage (validation/refus/litige)
 - [x] Étape 7 — Ladders (catégories LoL)
 - [x] Étape 8 — Fiabilité & pénalités
-- [ ] Étape 9 — Docs & DX
+- [x] Étape 9 — Docs & DX
 
 ## Notes restantes
 
 - Ajouter la configuration ESLint/Prettier dans les scripts CI ultérieurement.
 - Surveiller les impacts de la fiabilité sur le matchmaking ladder (ajuster les tolérances si besoin).
-- Préparer la documentation finale (Étape 9).
