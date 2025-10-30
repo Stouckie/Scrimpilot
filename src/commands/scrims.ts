@@ -8,6 +8,8 @@ import {
 } from 'discord.js';
 
 import { computeTeamSRTrimmed, isMatchupBalanced, validateRosterBalance } from '../lib/lol.js';
+import { CHECK_IN_EMOJI, CHECK_IN_REQUIRED } from '../lib/scrim-checkin.js';
+import { cancelScrimReminders, registerScrimReminders } from '../lib/scrim-scheduler.js';
 import {
   memberStore,
   scrimStore,
@@ -229,17 +231,106 @@ const scrimHandlers: HandlerMap = {
         ),
       )
       .catch((error) => console.error('Erreur lors de l’envoi du briefing de scrim :', error));
+
+    let checkInMessageId: string | undefined;
+    try {
+      const checkInMessage = await thread.send(
+        `📋 Merci de réagir avec ${CHECK_IN_EMOJI} (minimum ${CHECK_IN_REQUIRED} joueurs) pour valider votre présence.`,
+      );
+      checkInMessageId = checkInMessage.id;
+      await checkInMessage.react(CHECK_IN_EMOJI).catch((error) =>
+        console.error('Impossible d’ajouter la réaction de check-in :', error),
+      );
+    } catch (error) {
+      console.error('Erreur lors de la publication du message de check-in :', error);
+    }
     const timestamp = new Date().toISOString();
-    await scrimStore.update((scrims) =>
+    const updatedScrims = await scrimStore.update((scrims) =>
       scrims.map((match) =>
         match.id === scrim.id
-          ? { ...match, status: nextStatus, practiceReason, threadId: thread.id, rosters: [hostRosterRecord, guestRosterRecord], updatedAt: timestamp }
+          ? {
+              ...match,
+              status: nextStatus,
+              practiceReason,
+              threadId: thread.id,
+              rosters: [hostRosterRecord, guestRosterRecord],
+              checkInMessageId,
+              checkIns: [
+                { teamId: hostTeam.id, userIds: [] },
+                { teamId: guestTeam.id, userIds: [] },
+              ],
+              updatedAt: timestamp,
+            }
           : match,
       ),
     );
+    const updatedScrim = updatedScrims.find((match) => match.id === scrim.id);
+    if (updatedScrim) await registerScrimReminders(updatedScrim);
     await reply(
       interaction,
       `✅ Scrim ${scrim.id} ${nextStatus === 'PRACTICE' ? 'confirmé en mode practice' : 'confirmé'}. Thread : <#${thread.id}>.`,
+    );
+  },
+  async cancel(interaction) {
+    const scrimId = interaction.options.getString('match_id', true).trim();
+    const reason = interaction.options.getString('reason', true).trim();
+    if (!reason) return reply(interaction, '❌ Merci de préciser une raison d’annulation.');
+    const scrim = await fetchScrim(scrimId);
+    if (!scrim) return reply(interaction, '❌ Aucun scrim avec cet identifiant.');
+    if (scrim.status === 'CANCELLED') return reply(interaction, '⚠️ Ce scrim est déjà annulé.');
+    if (scrim.status === 'COMPLETED' || scrim.status === 'NO_SHOW')
+      return reply(interaction, '⚠️ Ce scrim est terminé et ne peut plus être annulé.');
+    const cancellingTeam = await ensureCaptainTeam(interaction.user.id);
+    if (!cancellingTeam) return reply(interaction, '⚠️ Aucune équipe dont tu es capitaine trouvée.');
+    if (![scrim.hostTeamId, scrim.guestTeamId].includes(cancellingTeam.id))
+      return reply(interaction, '❌ Tu ne peux annuler qu’un scrim où ton équipe est engagée.');
+
+    const scheduledAt = new Date(scrim.scheduledAt).getTime();
+    const now = Date.now();
+    const timestamp = new Date().toISOString();
+    const penaltyApplies = scheduledAt - now < 60 * 60 * 1000;
+    await scrimStore.update((scrims) =>
+      scrims.map((record) =>
+        record.id === scrim.id
+          ? {
+              ...record,
+              status: 'CANCELLED',
+              cancellation: { cancelledByTeamId: cancellingTeam.id, reason, cancelledAt: timestamp },
+              updatedAt: timestamp,
+            }
+          : record,
+      ),
+    );
+    if (penaltyApplies) {
+      await teamStore.update((teams) =>
+        teams.map((team) =>
+          team.id === cancellingTeam.id
+            ? { ...team, reliability: Math.max(0, team.reliability - 10), updatedAt: timestamp }
+            : team,
+        ),
+      );
+    }
+    cancelScrimReminders(scrim.id);
+
+    if (scrim.threadId) {
+      const channel = await interaction.client.channels.fetch(scrim.threadId).catch(() => null);
+      if (channel && 'isTextBased' in channel && channel.isTextBased()) {
+        const penaltyNote = penaltyApplies
+          ? 'Pénalité : -10 fiabilité (annulation < 60 min).'
+          : 'Aucune pénalité appliquée (annulation anticipée).';
+        await channel
+          .send(
+            `🛑 Scrim annulé par ${cancellingTeam.name}. Motif : ${reason}. ${penaltyNote}`,
+          )
+          .catch((error) => console.error('Erreur lors de la notification d’annulation :', error));
+      }
+    }
+
+    await reply(
+      interaction,
+      `✅ Scrim ${scrim.id} annulé. ${
+        penaltyApplies ? 'Une pénalité de fiabilité a été appliquée.' : 'Aucune pénalité appliquée.'
+      }`,
     );
   },
 };
@@ -279,6 +370,13 @@ const scrimCommand = new SlashCommandBuilder()
       .setName('confirm')
       .setDescription('Confirmer le scrim et créer le thread privé')
       .addStringOption((option) => option.setName('match_id').setDescription('Identifiant du scrim').setRequired(true)),
+  )
+  .addSubcommand((sub) =>
+    sub
+      .setName('cancel')
+      .setDescription('Annuler un scrim planifié')
+      .addStringOption((option) => option.setName('match_id').setDescription('Identifiant du scrim').setRequired(true))
+      .addStringOption((option) => option.setName('reason').setDescription('Motif détaillé').setRequired(true)),
   );
 
 export const scrimCommands: SlashCommand[] = [createSlashCommand(scrimCommand, scrimHandlers)];

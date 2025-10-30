@@ -64,6 +64,8 @@ export type Team = Timestamped & {
   reliability: number;
 };
 export type ScrimRoster = { teamId: string; playerIds: string[]; coachIds: string[]; declaredSr: number };
+export type ScrimCheckIn = { teamId: string; userIds: string[]; completedAt?: string };
+export type ScrimCancellation = { cancelledByTeamId: string; reason: string; cancelledAt: string };
 export type Scrim = Timestamped & {
   id: string;
   category: ScrimCategory;
@@ -77,6 +79,10 @@ export type Scrim = Timestamped & {
   guestTeamId?: string;
   rosters: ScrimRoster[];
   threadId?: string;
+  checkInMessageId?: string;
+  checkIns?: ScrimCheckIn[];
+  cancellation?: ScrimCancellation;
+  noShowTeamIds?: string[];
   arbitrationTicketId?: string;
 };
 export type LadderEntry = { teamId: string; rating: number; reliability: number; wins: number; losses: number; lastQueuedAt?: string };
