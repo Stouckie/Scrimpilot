@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 import {
   ChannelType,
   SlashCommandBuilder,
+  SlashCommandSubcommandsOnlyBuilder,
   ThreadAutoArchiveDuration,
   type ChatInputCommandInteraction,
+  type AnyThreadChannel,
   type TextBasedChannel,
   type TextChannel,
 } from 'discord.js';
@@ -22,12 +24,13 @@ import {
   type ScrimStatus,
   type ScrimCategory,
   type ScrimRoster,
+  type ScrimReport,
   type Team,
 } from '../lib/store.js';
 import type { SlashCommand } from './index.js';
 
 type Handler = (interaction: ChatInputCommandInteraction) => Promise<void>;
-interface HandlerMap extends Record<string, Handler> { __unknown: string; }
+type HandlerMap = Record<string, Handler>;
 interface RosterBuildResult { roster: ScrimRoster; players: Member[]; coaches: Member[]; srValues: number[]; missing: string[]; }
 
 const CATEGORY_CHOICES: readonly [string, ScrimCategory][] = [['IB', 'IB'], ['SG', 'SG'], ['PE', 'PE'], ['DM', 'DM'], ['GMC', 'GMC']];
@@ -37,14 +40,21 @@ const MESSAGE_URL_REGEX =
   /^https?:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/channels\/(\d+)\/(\d+)\/(\d+)$/i;
 const SCORE_REGEX = /^A(\d+)-B(\d+)$/i;
 const REPORTABLE_STATUSES = new Set<ScrimStatus>(['CONFIRMED', 'PRACTICE', 'AWAITING_ARBITRATION']);
-const reply = (interaction: ChatInputCommandInteraction, content: string) => interaction.reply({ content, ephemeral: true });
-const createSlashCommand = (builder: SlashCommandBuilder, handlers: HandlerMap): SlashCommand => ({
-  data: builder,
+const reply = async (interaction: ChatInputCommandInteraction, content: string) => {
+  await interaction.reply({ content, ephemeral: true });
+};
+const createSlashCommand = (
+  builder: SlashCommandBuilder | SlashCommandSubcommandsOnlyBuilder,
+  handlers: HandlerMap,
+  fallback: string,
+): SlashCommand => ({
+  data: builder as SlashCommandBuilder,
   async execute(interaction) {
     if (!interaction.isChatInputCommand()) return;
-    const run = handlers[interaction.options.getSubcommand()];
+    const sub = interaction.options.getSubcommand(false);
+    const run = sub ? handlers[sub] : undefined;
     if (run) await run(interaction);
-    else await reply(interaction, handlers.__unknown);
+    else await reply(interaction, fallback);
   },
 });
 const parseMessageUrl = (value: string) => {
@@ -63,7 +73,7 @@ const normalizeScoreInput = (score: string) => {
   return `A${hostRaw}-B${guestRaw}`;
 };
 const resolveProofLink = async (
-  thread: TextBasedChannel,
+  thread: AnyThreadChannel,
   expectedGuildId: string,
   expectedChannelId: string,
   expectedAuthorId: string,
@@ -127,7 +137,7 @@ const fetchScrim = async (scrimId: string): Promise<Scrim | undefined> => {
   const scrims = await scrimStore.read();
   return scrims.find((scrim) => scrim.id === scrimId);
 };
-const addParticipantsToThread = async (thread: TextChannel['threads']['channel'], rosters: RosterBuildResult[]) => {
+const addParticipantsToThread = async (thread: AnyThreadChannel, rosters: RosterBuildResult[]) => {
   const ids = [...new Set(rosters.flatMap((roster) => [...roster.players, ...roster.coaches].map((member) => member.discordId)))];
   await Promise.allSettled(
     ids.map(async (discordId) => {
@@ -160,7 +170,6 @@ const buildThreadSummary = (scrim: Scrim, hostTeam: Team, guestTeam: Team, hostR
 };
 
 const scrimHandlers: HandlerMap = {
-  __unknown: '❌ Sous-commande scrim inconnue.',
   async post(interaction) {
     const category = interaction.options.getString('category', true) as ScrimCategory;
     const preset = interaction.options.getString('preset', true);
@@ -244,7 +253,7 @@ const scrimHandlers: HandlerMap = {
     const channel = await guild.channels.fetch(scrimsChannelId).catch(() => null);
     if (!channel || channel.type !== ChannelType.GuildText) return reply(interaction, '❌ SCRIMS_CHANNEL_ID doit pointer vers un salon textuel.');
     const threadName = `scrim-${scrim.category.toLowerCase()}-${scrim.id.slice(0, 6)}`;
-    let thread;
+    let thread: AnyThreadChannel;
     try {
       thread = await (channel as TextChannel).threads.create({
         name: threadName,
@@ -335,8 +344,9 @@ const scrimHandlers: HandlerMap = {
       return fail('⚠️ Ce scrim ne peut pas être reporté dans son état actuel (annulé, no-show ou non confirmé).');
 
     const threadChannel = await interaction.client.channels.fetch(scrim.threadId).catch(() => null);
-    if (!threadChannel || !threadChannel.isTextBased()) return fail('❌ Thread privé introuvable ou inaccessible.');
-    const thread = threadChannel as TextBasedChannel;
+    if (!threadChannel || !('isThread' in threadChannel) || !threadChannel.isThread())
+      return fail('❌ Thread privé introuvable ou inaccessible.');
+    const thread = threadChannel as AnyThreadChannel;
 
     const teams = await teamStore.read();
     const hostTeam = teams.find((team) => team.id === scrim.hostTeamId);
@@ -368,7 +378,7 @@ const scrimHandlers: HandlerMap = {
     const [victoryProofUrl, scoreboardProofUrl] = resolvedProofs;
 
     const timestamp = new Date().toISOString();
-    const report: Scrim['reports'][number] = {
+    const report: ScrimReport = {
       teamId: reporterTeam.id,
       reportedBy: interaction.user.id,
       score: normalizedScore,
@@ -443,7 +453,9 @@ const scrimHandlers: HandlerMap = {
         ? `📎 Les deux équipes ont reporté. Ticket d’arbitrage ${ticketId ?? ''} créé.`.trim()
         : '⚠️ Les deux équipes ont reporté mais la carte d’arbitrage n’a pas pu être publiée. Merci de prévenir le staff.'
       : `📎 Rapport reçu pour ${reporterTeam.name}. En attente de l’autre équipe.`;
-    await thread.send(threadMessage).catch((error) => console.error('Erreur lors de la notification de report :', error));
+    await thread
+      .send(threadMessage)
+      .catch((error: unknown) => console.error('Erreur lors de la notification de report :', error));
   },
   async cancel(interaction) {
     const scrimId = interaction.options.getString('match_id', true).trim();
@@ -488,15 +500,16 @@ const scrimHandlers: HandlerMap = {
 
     if (scrim.threadId) {
       const channel = await interaction.client.channels.fetch(scrim.threadId).catch(() => null);
-      if (channel && 'isTextBased' in channel && channel.isTextBased()) {
+      if (channel && 'isThread' in channel && channel.isThread()) {
+        const target = channel as AnyThreadChannel;
         const penaltyNote = penaltyApplies
           ? 'Pénalité : -10 fiabilité (annulation < 60 min).'
           : 'Aucune pénalité appliquée (annulation anticipée).';
-        await channel
+        await target
           .send(
             `🛑 Scrim annulé par ${cancellingTeam.name}. Motif : ${reason}. ${penaltyNote}`,
           )
-          .catch((error) => console.error('Erreur lors de la notification d’annulation :', error));
+          .catch((error: unknown) => console.error('Erreur lors de la notification d’annulation :', error));
       }
     }
 
@@ -577,4 +590,6 @@ const scrimCommand = new SlashCommandBuilder()
       .addStringOption((option) => option.setName('reason').setDescription('Motif détaillé').setRequired(true)),
   );
 
-export const scrimCommands: SlashCommand[] = [createSlashCommand(scrimCommand, scrimHandlers)];
+export const scrimCommands: SlashCommand[] = [
+  createSlashCommand(scrimCommand, scrimHandlers, '❌ Sous-commande scrim inconnue.'),
+];

@@ -2,6 +2,7 @@ import type {
   MessageReaction,
   PartialMessageReaction,
   PartialUser,
+  TextBasedChannel,
   User,
 } from 'discord.js';
 
@@ -19,6 +20,11 @@ async function resolveInputs(reaction: ReactionInput, user: UserInput) {
   if (fullReaction.emoji.name !== CHECK_IN_EMOJI) return;
   return { reaction: fullReaction as MessageReaction, user: fullUser };
 }
+
+const hasSend = (
+  channel: TextBasedChannel | null,
+): channel is TextBasedChannel & { send: (content: string) => Promise<unknown> } =>
+  Boolean(channel && typeof (channel as { send?: unknown }).send === 'function');
 
 export async function handleCheckInReaction(reactionInput: ReactionInput, userInput: UserInput, action: 'add' | 'remove') {
   const resolved = await resolveInputs(reactionInput, userInput);
@@ -67,8 +73,11 @@ export async function handleCheckInReaction(reactionInput: ReactionInput, userIn
     const message = thresholdReached
       ? `✅ Check-in validé pour ${teamName} (${entry.userIds.length}/${CHECK_IN_REQUIRED}).`
       : `ℹ️ Check-in incomplet pour ${teamName}. Merci d’utiliser ${CHECK_IN_EMOJI}.`;
-    await reaction.message.channel
-      .send(message)
-      .catch((error) => console.error('Erreur lors de la notification de check-in :', error));
+    const channel = reaction.message.channel;
+    if (hasSend(channel)) {
+      await channel
+        .send(message)
+        .catch((error: unknown) => console.error('Erreur lors de la notification de check-in :', error));
+    }
   }
 }

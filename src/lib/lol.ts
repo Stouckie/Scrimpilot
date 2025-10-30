@@ -1,4 +1,4 @@
-import { QueueLevel, LolRank } from './store';
+import { QueueLevel, LolRank } from './store.js';
 
 export const rankToSkillRating: Record<LolRank, number> = {
   iron: 0,

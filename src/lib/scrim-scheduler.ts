@@ -1,4 +1,4 @@
-import type { Client } from 'discord.js';
+import type { Client, TextBasedChannel } from 'discord.js';
 
 import { scrimStore, teamStore, type Scrim, type ScrimStatus } from './store.js';
 
@@ -14,8 +14,17 @@ const clearTimers = (scrimId: string) => {
 const post = async (threadId: string, content: string) => {
   if (!clientRef) return;
   const channel = await clientRef.channels.fetch(threadId).catch(() => null);
-  if (channel && 'isTextBased' in channel && channel.isTextBased()) {
-    await channel.send({ content }).catch((error) => console.error(`Rappel scrim échoué (${threadId}) :`, error));
+  if (
+    channel &&
+    'isTextBased' in channel &&
+    typeof channel.isTextBased === 'function' &&
+    channel.isTextBased() &&
+    typeof (channel as { send?: unknown }).send === 'function'
+  ) {
+    const target = channel as TextBasedChannel & { send: (payload: unknown) => Promise<unknown> };
+    await target
+      .send({ content })
+      .catch((error: unknown) => console.error(`Rappel scrim échoué (${threadId}) :`, error));
   }
 };
 const scheduleAt = (scrimId: string, timestamp: number, job: () => void, runIfPast = false) => {

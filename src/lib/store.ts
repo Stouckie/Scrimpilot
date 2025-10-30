@@ -99,9 +99,37 @@ export type Scrim = Timestamped & {
   validatedBy?: string;
   validatedAt?: string;
 };
-export type LadderEntry = { teamId: string; rating: number; reliability: number; wins: number; losses: number; lastQueuedAt?: string };
-export type LadderMatch = { id: string; ladderId: string; scrimId?: string; scheduledAt: string; status: ScrimStatus; result?: string };
-export type Ladder = Timestamped & { id: string; name: string; category: ScrimCategory; region: string; level: QueueLevel; status: LadderStatus; entries: LadderEntry[]; matches: LadderMatch[] };
+export type LadderEntry = {
+  teamId: string;
+  rating: number;
+  reliability: number;
+  wins: number;
+  losses: number;
+  lastQueuedAt?: string;
+};
+export type LadderMatch = Timestamped & {
+  id: string;
+  ladderId: string;
+  hostTeamId: string;
+  guestTeamId: string;
+  queueLevel: QueueLevel;
+  scheduledAt: string;
+  status: ScrimStatus;
+  reports?: ScrimReport[];
+  result?: string;
+  arbitrationTicketId?: string;
+  completedAt?: string;
+};
+export type Ladder = Timestamped & {
+  id: string;
+  name: string;
+  category: ScrimCategory;
+  region: string;
+  level: QueueLevel;
+  status: LadderStatus;
+  entries: LadderEntry[];
+  matches: LadderMatch[];
+};
 export type ArbitrationTicket = Timestamped & {
   id: string;
   matchId: string;
